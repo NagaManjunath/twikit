@@ -144,6 +144,24 @@ await client.get_trends('trending')
 
 More Examples: [examples](https://github.com/d60/twikit/tree/main/examples) <br>
 
+## Friendship pagination in this fork
+
+`get_user_following(user_id, count=20, cursor=None)` returns a `Result[User]`.
+Pass its `next_cursor` to resume, or call `await result.next()`. A validated
+terminal page has `next_cursor is None`; calling `next()` on it returns an empty
+result without another provider request. Valid empty entry lists and user pages
+without a bottom cursor are terminal.
+
+Missing timelines, malformed entries/cursors, partial GraphQL errors, unknown
+timeline instructions, and filtered/unavailable user entries raise
+`twikit.errors.InvalidResponse`. They cannot establish a complete membership
+snapshot. Preserve the last committed checkpoint on failure and reconcile unseen
+members only after a complete successful traversal. Blank or repeated bottom
+cursors are errors, rather than proof of completion. Error messages omit provider
+payloads. These rules also apply to the other shared friendship endpoints.
+
+Offline regressions: `python -m unittest discover -s tests -v`.
+
 ## Contributing
 
 If you encounter any bugs or issues, please report them on [issues](https://github.com/d60/twikit/issues).

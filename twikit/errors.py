@@ -12,6 +12,9 @@ class TwitterException(Exception):
         else:
             self.headers = dict(headers)
 
+class InvalidResponse(TwitterException):
+    """The provider response cannot establish a valid, complete page."""
+
 class BadRequest(TwitterException):
     """
     Exception raised for 400 Bad Request errors.

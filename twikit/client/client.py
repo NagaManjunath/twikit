@@ -26,6 +26,7 @@ from ..errors import (
     CouldNotTweet,
     Forbidden,
     InvalidMedia,
+    InvalidResponse,
     NotFound,
     RequestTimeout,
     ServerError,
@@ -60,6 +61,65 @@ from ..x_client_transaction.utils import handle_x_migration
 from ..x_client_transaction import ClientTransaction
 from .gql import GQLClient
 from .v11 import V11Client
+
+
+def _friendship_timeline_entries(response: dict) -> list[dict]:
+    """Require an explicit friendship page before interpreting absent cursors.
+
+    Missing/error data is not an empty snapshot. Read the user's timeline rather
+    than recursively finding unrelated entries elsewhere in a partial response.
+    """
+    message = 'Invalid or incomplete friendship timeline response'
+    if not isinstance(response, dict) or response.get('errors'):
+        raise InvalidResponse(message)
+    try:
+        result = response['data']['user']['result']
+        timeline = result['timeline']
+        # Both direct and nested timeline envelopes occur in GraphQL responses.
+        if 'timeline' in timeline:
+            timeline = timeline['timeline']
+        instructions = timeline['instructions']
+    except (KeyError, TypeError):
+        raise InvalidResponse(message) from None
+    if not isinstance(instructions, list) or not instructions:
+        raise InvalidResponse(message)
+
+    entries = []
+    has_page = False
+    terminated = False
+    for instruction in instructions:
+        if not isinstance(instruction, dict):
+            raise InvalidResponse(message)
+        kind = instruction.get('type')
+        if kind == 'TimelineAddEntries':
+            batch = instruction.get('entries')
+            if not isinstance(batch, list):
+                raise InvalidResponse(message)
+            entries.extend(batch)
+            has_page = True
+        elif kind == 'TimelineReplaceEntry':
+            # Replacement cursors must not be lost while reading AddEntries.
+            entry = instruction.get('entry')
+            if not isinstance(entry, dict) or not str(entry.get('entryId', '')).startswith('cursor-'):
+                raise InvalidResponse(message)
+            entries.append(entry)
+            has_page = True
+        elif kind == 'TimelineTerminateTimeline':
+            direction = instruction.get('direction')
+            if direction not in ('Top', 'Bottom'):
+                raise InvalidResponse(message)
+            terminated = terminated or direction == 'Bottom'
+        elif kind != 'TimelineClearCache':
+            # Unknown instructions may contain omitted members or continuation.
+            raise InvalidResponse(message)
+    if not has_page and not terminated:
+        raise InvalidResponse(message)
+    if terminated and any(
+        isinstance(entry, dict) and str(entry.get('entryId', '')).startswith('cursor-bottom')
+        for entry in entries
+    ):
+        raise InvalidResponse(message)
+    return entries
 
 
 class Client:
@@ -2655,28 +2715,35 @@ class Client:
         """
         response, _ = await f(user_id, count, cursor)
 
-        items_ = find_dict(response, 'entries', find_one=True)
-        if not items_:
-            return Result.empty()
-        items = items_[0]
+        items = _friendship_timeline_entries(response)
         results = []
         next_cursor = None
         for item in items:
+            if not isinstance(item, dict) or not isinstance(item.get('entryId'), str):
+                raise InvalidResponse('Invalid friendship timeline entry')
             entry_id = item['entryId']
             if entry_id.startswith('user'):
                 user_info = find_dict(item, 'result', find_one=True)
-                if not user_info:
-                    warnings.warn(
-                        'Some followers are excluded because '
-                        '"Quality Filter" is enabled. To get all followers, '
-                        'turn off it in the Twitter settings.'
-                    )
-                    continue
-                if user_info[0].get('__typename') == 'UserUnavailable':
-                    continue
-                results.append(User(self, user_info[0]))
+                if (not user_info or not isinstance(user_info[0], dict)
+                        or user_info[0].get('__typename') != 'User'
+                        or not isinstance(user_info[0].get('rest_id'), str)
+                        or not user_info[0]['rest_id'].isdigit()):
+                    # Silently skipping filtered/unavailable users would turn an
+                    # incomplete membership snapshot into a successful one.
+                    raise InvalidResponse('Incomplete friendship user entry')
+                try:
+                    results.append(User(self, user_info[0]))
+                except (KeyError, TypeError, AttributeError, ValueError):
+                    raise InvalidResponse('Invalid friendship user entry') from None
             elif entry_id.startswith('cursor-bottom'):
-                next_cursor = item['content']['value']
+                content = item.get('content')
+                value = content.get('value') if isinstance(content, dict) else None
+                if (next_cursor is not None or not isinstance(value, str)
+                        or not value.strip() or value == cursor):
+                    raise InvalidResponse('Invalid friendship continuation cursor')
+                next_cursor = value
+            elif not entry_id.startswith('cursor-top'):
+                raise InvalidResponse('Unsupported friendship timeline entry')
 
         return Result(
             results,
