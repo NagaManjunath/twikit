@@ -2660,6 +2660,7 @@ class Client:
             return Result.empty()
         items = items_[0]
         results = []
+        next_cursor = None
         for item in items:
             entry_id = item['entryId']
             if entry_id.startswith('user'):
@@ -2679,7 +2680,8 @@ class Client:
 
         return Result(
             results,
-            partial(self._get_user_friendship, user_id, count, f, next_cursor),
+            partial(self._get_user_friendship, user_id, count, f, next_cursor)
+            if next_cursor else None,
             next_cursor
         )
 
